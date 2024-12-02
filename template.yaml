@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Transform: AWS::Serverless-2016-10-31
+
+Description: SAM Template for Serverless Event Driven Architecture
+
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  OrderEmitEventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderEmitEventQueue
+      SqsManagedSseEnabled: false
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 1
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DeadLetterQueue
+      SqsManagedSseEnabled: false
+
+  DeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DeadLetterQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt DeadLetterQueue.Arn
+
+  # QueuePolicy:
+  #   DependsOn: ["OrderEventQueue"]
+  #   Type: AWS::SQS::QueuePolicy
+  #   Properties:
+  #     PolicyDocument:
+  #       Statement:
+  #         - Effect: Allow
+  #           Action:
+  #             - sqs:SendMessage
+  #           Principal:
+  #             Service: apigateway.amazonaws.com
+  #           Resource: !GetAtt OrderEventQueue.Arn
+  #       Version: "2012-10-17"
+  #     Queues:
+  #       - !Ref OrderEventQueue
+
+  ApiGatewayToSQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: ApiGatewayToSQSRole
+      Policies:
+        - PolicyName: ApiGatewayLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource: !GetAtt "OrderEmitEventQueue.Arn"
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Effect: Allow
+                Resource: "*"
+
+  EmitOrderAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Name: EmitOrderAPI
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub ${AWS::StackName}-EmitOrderAPI-API
+        paths:
+          /event/emit:
+            post:
+              consumes:
+                - "application/json"
+              produces:
+                - "application/json"
+              responses:
+                "200":
+                  description: Event post successfully handled and placed on queue
+                "400":
+                  description: Bad request
+                "500":
+                  description: Server Error
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                passthroughBehavior: "never"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${OrderEmitEventQueue.QueueName}"
+                credentials: !GetAtt ApiGatewayToSQSRole.Arn
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: "Action=SendMessage&MessageBody=$input.body"
+                responses:
+                  default:
+                    statusCode: "200"
+
+  EmitOrderEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReceiveFromSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrderEmitEventQueue.Arn
+        - PolicyName: PutEventsToEventBus
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+
+  EmitOrderEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: emit_event.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./lambda
+      Role: !GetAtt EmitOrderEventRole.Arn
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderEmitEventQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref OrderEventBus
+
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: OrderBus
+
+  OrderEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - "com.myapp.orders"
+        detail-type:
+          - "OrderPlaced"
+        detail:
+          category:
+            - "api_gw"
+      Targets:
+        - Id: APIGatewayTarget
+          Arn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReceiveOrderEventAPI}/dev/POST/event/handle"
+          RoleArn: !GetAtt EventBridgeInvokeApiRole.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt DeadLetterQueue.Arn
+
+  EventBridgeInvokeApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeApiPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "execute-api:Invoke"
+                Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReceiveOrderEventAPI}/dev/POST/event/handle"
+
+  OrderReceiveEventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderReceiveEventQueue
+      SqsManagedSseEnabled: false
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 1
+
+  ReceiveOrderEventAPIToSQSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: ReceiveOrderEventAPIToSQSRole
+      Policies:
+        - PolicyName: ApiGatewayWriteToSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource: !GetAtt "OrderReceiveEventQueue.Arn"
+        - PolicyName: ApiGatewayWriteToCWLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Effect: Allow
+                Resource: "*"
+
+  ReceiveOrderEventAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      Name: ReceiveOrderEventAPI
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub ${AWS::StackName}-ReceiveOrderEventAPI-API
+        paths:
+          /event/handle:
+            post:
+              consumes:
+                - "application/json"
+              produces:
+                - "application/json"
+              responses:
+                "200":
+                  description: Event post successfully handled and placed on queue
+                "400":
+                  description: Bad request
+                "500":
+                  description: Server Error
+              x-amazon-apigateway-integration:
+                type: "aws"
+                httpMethod: "POST"
+                passthroughBehavior: "never"
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${OrderReceiveEventQueue.QueueName}"
+                credentials: !GetAtt ReceiveOrderEventAPIToSQSRole.Arn
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: "Action=SendMessage&MessageBody=$input.body"
+                responses:
+                  default:
+                    statusCode: "200"
+
+  OrderEventHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./lambda
+      Events:
+        # SNS:
+        #   Type: SNS
+        #   Properties:
+        #     Topic: !Ref OrderNotificationTopic
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderReceiveEventQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          # TABLE_NAME: !Ref OrderTable
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReceiveFromSQS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrderReceiveEventQueue.Arn
+      #   - PolicyName: DynamoDBAccess
+      #     PolicyDocument:
+      #       Version: "2012-10-17"
+      #       Statement:
+      #         - Effect: Allow
+      #           Action:
+      #             - dynamodb:PutItem
+      #             - dynamodb:UpdateItem
+      #             - dynamodb:GetItem
+      #           Resource: !GetAtt OrderTable.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
