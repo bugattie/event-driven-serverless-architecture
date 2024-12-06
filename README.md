@@ -4,6 +4,12 @@ This project demonstrates a **serverless event-driven architecture** using AWS S
 
 ---
 
+## Workflow Architecture Design
+
+![workflow-design](https://github.com/user-attachments/assets/e4256520-e111-4ec1-a69d-f0de9b8c8733)
+
+---
+
 ## Phase One: Emitting an Event
 
 ### API Gateway
