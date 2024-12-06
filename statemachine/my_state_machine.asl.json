@@ -1,0 +1,60 @@
+{
+  "StartAt": "ValidateOrder",
+  "States": {
+    "ValidateOrder": {
+      "Type": "Task",
+      "Resource": "${ValidateOrderFunctionArn}",
+      "Catch": [
+        {
+          "ErrorEquals": ["ValidationError"],
+          "ResultPath": "$.errorInfo",
+          "Next": "HandleValidationError"
+        }
+      ],
+      "Next": "EnrichOrder"
+    },
+    "EnrichOrder": {
+      "Type": "Task",
+      "Resource": "${EnrichOrderFunctionArn}",
+      "Next": "CategorizeOrder"
+    },
+    "CategorizeOrder": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.detail.priority",
+          "StringEquals": "high-priority",
+          "Next": "HighPriorityQueue"
+        },
+        {
+          "Variable": "$.detail.priority",
+          "StringEquals": "low-priority",
+          "Next": "LowPriorityNotification"
+        }
+      ]
+    },
+    "HighPriorityQueue": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "${HighPriorityQueueUrl}",
+        "MessageBody.$": "$.detail"
+      },
+      "End": true
+    },
+    "LowPriorityNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${LowPriorityTopicArn}",
+        "Message.$": "$.detail"
+      },
+      "End": true
+    },
+    "HandleValidationError": {
+      "Type": "Fail",
+      "Error": "ValidationFailed",
+      "Cause": "The input event did not pass validation checks."
+    }
+  }
+}

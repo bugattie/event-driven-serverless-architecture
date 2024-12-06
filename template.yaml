@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Transform: AWS::Serverless-2016-10-31
 
-Description: SAM Template for Serverless Event Driven Architecture
+Description: SAM Template for Serverless Event-Driven Architecture
 
 Globals:
   Function:
@@ -23,22 +23,6 @@ Resources:
     Properties:
       QueueName: DeadLetterQueue
       SqsManagedSseEnabled: false
-
-  # QueuePolicy:
-  #   DependsOn: ["OrderEventQueue"]
-  #   Type: AWS::SQS::QueuePolicy
-  #   Properties:
-  #     PolicyDocument:
-  #       Statement:
-  #         - Effect: Allow
-  #           Action:
-  #             - sqs:SendMessage
-  #           Principal:
-  #             Service: apigateway.amazonaws.com
-  #           Resource: !GetAtt OrderEventQueue.Arn
-  #       Version: "2012-10-17"
-  #     Queues:
-  #       - !Ref OrderEventQueue
 
   ApiGatewayToSQSRole:
     Type: AWS::IAM::Role
@@ -196,6 +180,23 @@ Resources:
         - Id: SNSTarget
           Arn: !Ref OrderNotificationTopic
 
+  OrderStepFunctionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref OrderEventBus
+      EventPattern:
+        source:
+          - "com.myapp.orders"
+        detail-type:
+          - "OrderPlaced"
+        detail:
+          category:
+            - "step_function"
+      Targets:
+        - Id: STEPFUNCTION_Target
+          Arn: !Ref OrderProcessingStateMachine
+          RoleArn: !GetAtt EventBridgeInvokeStepFunctionRole.Arn
+
   OrderNotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -233,6 +234,27 @@ Resources:
               - Effect: Allow
                 Action: "execute-api:Invoke"
                 Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ReceiveOrderEventAPI}/dev/POST/event/handle"
+
+  EventBridgeInvokeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStepFunctionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt OrderProcessingStateMachine.Arn
 
   OrderReceiveEventQueue:
     Type: AWS::SQS::Queue
@@ -391,3 +413,91 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: sns.amazonaws.com
       SourceArn: !Ref OrderNotificationTopic
+
+  ValidateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: validate_order.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./lambda
+      MemorySize: 128
+      Timeout: 5
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  EnrichOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: enrich_order.lambda_handler
+      Runtime: python3.9
+      CodeUri: ./lambda
+      MemorySize: 128
+      Timeout: 5
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-StepFunctionsExecutionRoleToInvokeLambda"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ValidateOrderFunction.Arn
+                  - !GetAtt EnrichOrderFunction.Arn
+        - PolicyName: !Sub "${AWS::StackName}-StepFunctionsExecutionRoleToSendMessageToQueue"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt HighPriorityQueue.Arn
+        - PolicyName: !Sub "${AWS::StackName}-StepFunctionsExecutionRoleToPublishToTopic"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref LowPriorityTopic
+
+  HighPriorityQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: HighPriorityQueue
+
+  LowPriorityTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: LowPriorityTopic
+
+  OrderProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionUri: statemachine/my_state_machine.asl.json
+      DefinitionSubstitutions:
+        ValidateOrderFunctionArn: !GetAtt ValidateOrderFunction.Arn
+        EnrichOrderFunctionArn: !GetAtt EnrichOrderFunction.Arn
+        HighPriorityQueueUrl: !GetAtt HighPriorityQueue.QueueUrl
+        LowPriorityTopicArn: !GetAtt LowPriorityTopic.TopicArn
+
+Outputs:
+  EmitEventAPI:
+    Value: !Sub "https://${EmitOrderAPI}.execute-api.us-east-1.amazonaws.com/dev/event/emit"
+    Export:
+      Name: EmitEventAPI
