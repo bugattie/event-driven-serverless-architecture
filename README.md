@@ -67,3 +67,43 @@ This project demonstrates a **serverless event-driven architecture** using AWS S
 ---
 
 This modular and serverless approach ensures scalability, fault tolerance, and ease of integration across multiple services, making it ideal for modern cloud-native applications.
+
+---
+
+## How Does It Work?
+
+1. **Install SAM CLI**  
+   Ensure you have the **AWS SAM CLI** installed on your machine.
+
+2. **Clone the Repository**  
+   Download or clone this repository to your local machine.
+
+3. **Deploy the Infrastructure**  
+   Open the terminal in the project directory and issue the following command:
+
+`sam deploy --stack-name sam-stack --capabilities CAPABILITY_NAMED_IAM`
+
+The output will provide the API Gateway URL.
+
+4. **Send an Event**  
+   Use an HTTP client like Postman and make a `POST` request to the API Gateway URL. Ensure your request includes a valid payload as per the application's requirements.
+
+---
+
+## Verify the Output
+
+Check the respective AWS service consoles to observe the workflow's behavior:
+
+- **Amazon EventBridge**: Monitor the event bus and verify if events are being routed to the correct targets based on the rules.
+- **Amazon SQS**: Check the queue to confirm if events are correctly being placed for processing.
+- **Amazon DynamoDB**: Review the stored data to ensure events are being stored as expected.
+
+You may choose to switch between different categories (e.g., `api_gw`, `sns`, `step_function`) to test various scenarios and observe how the system handles different types of events.
+
+---
+
+## Clean Up Resources
+
+When you’re done testing or running the workflow, you can remove all provisioned resources with the following command:
+
+`sam delete --stack-name sam-stack`
